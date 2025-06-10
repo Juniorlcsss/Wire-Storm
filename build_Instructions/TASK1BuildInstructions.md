@@ -1,3 +1,6 @@
+#kill other instances
+pkill -f wire-storm
+
 #Build and run
 cargo build --release
 ./target/release/wire-storm &
