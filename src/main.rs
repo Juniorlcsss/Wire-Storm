@@ -1,5 +1,5 @@
 //imports
-use std::{io::{Read,Write}, net::{Shutdown, TcpListener, TcpStream}, sync::{Arc,Mutex},thread,time::Duration};
+use std::{io::{ErrorKind, IoSlice, Read, Write}, net::{Shutdown, TcpListener, TcpStream}, sync::{Arc,Mutex},thread,time::Duration};
 
 //constants
 const SRC_PORT: u16 = 33333;    //SEND_PORT in client.py    single send
@@ -8,9 +8,13 @@ const HEADER_LENGTH: usize= 8;  //HEADER_SIZE in tests.py
 const MAGIC_BYTE: u8 = 0xCC;    //MAGIC_BYTE in tests.py    (byte-0 of every frame)
 const SENSITIVE_BIT: u8 = 0x40;
 const RESERVE_BIT: u8 = 0x80;
+const PADDING_MASK: u8 = 0x3F;
+const MAX_CAPACITY: usize =65536;
 
 type SharedList = Arc<Mutex<Vec<TcpStream>>>;
 
+
+#[inline(always)]
 fn calc_checksum(data: &[u8]) ->u16 {
     //calculate the ones complement checksum
     let mut sum: u32=0;
@@ -49,8 +53,7 @@ fn verify_checksum(header: &[u8], body: &[u8], received_checksum: u16) -> bool {
     total.extend_from_slice(&check_head);
     total.extend_from_slice(body);
 
-    let calc = calc_checksum(&total);
-    calc == received_checksum
+    calc_checksum(&total)==received_checksum
 }
 
 fn init_receiver(recievers:SharedList)->anyhow::Result<()>{
@@ -62,7 +65,9 @@ fn init_receiver(recievers:SharedList)->anyhow::Result<()>{
             match connection{
                 Ok(stream)=>{
                     let _ = stream.set_nodelay(true);
-                    println!("New receiver connected: {}",stream.peer_addr().unwrap());
+                    if let Ok(addr)=stream.peer_addr(){
+                        println!("New receiver connected: {addr:?}");
+                    }
                     recievers.lock().unwrap().push(stream);
                 }
                 Err(e) => eprintln!("Receiver accept error: {:?}",e),
@@ -72,6 +77,38 @@ fn init_receiver(recievers:SharedList)->anyhow::Result<()>{
     Ok(())
 }
 
+#[inline(always)]
+fn verify_header(hdr: &[u8]) -> Result<(u16, bool), &'static str> {
+    //get info
+    let length= u16::from_be_bytes([hdr[2], hdr[3]]);
+    let options = hdr[1];
+    let sensitive = (options & SENSITIVE_BIT)!=0;
+    
+    
+    //check magic byte
+    if hdr[0]!= MAGIC_BYTE{
+        return Err("Invalid magic byte");
+    }
+    //check reserve bit
+    if(options & RESERVE_BIT)!=0{
+        return Err("Reserve bit must be 0");
+    }
+    //check padding bits
+    if(options & PADDING_MASK) !=0{
+        return Err("Invalid padding");
+    }
+    //check padding based on message type
+    if !sensitive && hdr[4..8]!=[0x00;4]{
+        return Err("Invaid padding for non sensitive");
+    }
+    else if sensitive && hdr[6..8] != [0x00; 2]{
+        return Err("Invaid padding for sensitive");
+    }
+
+    Ok((length,sensitive))
+
+}
+
 fn handle_source(mut src:TcpStream, receivers: SharedList){
     /*
         Read CTMP frames from a single source and then broadcast
@@ -79,104 +116,77 @@ fn handle_source(mut src:TcpStream, receivers: SharedList){
     println!("Source connection from {:?}", src.peer_addr());
     let _ =src.set_nodelay(true);
     let _ = src.set_read_timeout(Some(Duration::from_secs(30)));
+    let mut head_buffer = [0u8; HEADER_LENGTH];
+    let mut body_buffer = Vec::with_capacity(MAX_CAPACITY);
     
     loop{
         //read header
-        let mut hdr = [0u8; HEADER_LENGTH];
-        if let Err(e)= src.read_exact(&mut hdr){
-            eprintln!("Source closed ({e:?})");
-            break;
-        }
-
-        //get info
-        let length = u16::from_be_bytes([hdr[2], hdr[3]]) as usize;
-        let options = hdr[1];
-        let checksum = u16::from_be_bytes([hdr[4],hdr[5]]);
-        let sensitive = (options & SENSITIVE_BIT)!=0;
-
-        //validate magic byte
-        if hdr[0] != MAGIC_BYTE {
-            eprintln!("magic or padding check failed");
-            let mut discard = vec![0u8;length];
-            if let Err(e)=src.read_exact(&mut discard){
-                eprintln!("Failed to discard body: {e:?}");
+        match src.read_exact(&mut head_buffer){
+            Ok(_)=>{}
+            Err(e)=>{
+                if e.kind()!=ErrorKind::UnexpectedEof{
+                    eprintln!("Error reading header {e:?}");
+                }
                 break;
             }
-            continue;
         }
 
-        //validate options
-        if (options & RESERVE_BIT) !=0 || (options &0x3F) != 0 {
-            eprintln!("invalid options");
-            let mut discard = vec![0u8;length];
-            if let Err(e)=src.read_exact(&mut discard){
-                eprintln!("Failed to discard body: {e:?}");
-                break;
+        //check header and get info
+        let(length, sensitive) = match verify_header(&head_buffer){
+            Ok(result)=>result,
+            Err(msg)=>{
+                eprintln!("{msg:?}");
+                let mut discard = vec![0u8;u16::from_be_bytes([head_buffer[2], head_buffer[3]]) as usize];
+                if src.read_exact(&mut discard).is_err(){
+                    break;
+                }
+                continue;
             }
-            continue;
-        }
-
-        //non sensitive
-        if !sensitive && (hdr[4..8] != [0x00; 4]) {
-            eprintln!("Invalid padding for non-sensitive message");
-            let mut discard = vec![0u8;length];
-            if let Err(e)=src.read_exact(&mut discard){
-                eprintln!("Failed to discard body: {e:?}");
-                break;
-            }
-            continue;
-        }
-
-        //sensitive
-        if sensitive && (hdr[6..8] != [0x00; 2]) {
-            eprintln!("Invalid padding bytes");
-            let mut discard = vec![0u8;length];
-            if let Err(e)=src.read_exact(&mut discard){
-                eprintln!("Failed to discard body: {e:?}");
-                break;
-            }
-            continue;
-        }
+        };
         
         //read body
-        let mut body = vec![0u8; length];
-        if let Err(e)=src.read_exact(&mut body){
+        body_buffer.clear();
+        body_buffer.resize(length as usize,0);
+        if let Err(e)=src.read_exact(&mut body_buffer){
             eprintln!("Closed whilst reading body: ({e:?})");
             break;
         }
 
         //validate checksum
         if sensitive{
-            if !verify_checksum(&hdr, &body, checksum){
+            let checksum = u16::from_be_bytes([head_buffer[4], head_buffer[5]]);
+            if !verify_checksum(&head_buffer, &body_buffer, checksum){
                 eprintln!("Invalid checksum");
                 continue;
             }
         }
 
-        //compose frame
-        let mut frame = Vec::with_capacity(HEADER_LENGTH+length);
-        frame.extend_from_slice(&hdr);
-        frame.extend_from_slice(&body);
-
         //broadcast
-        let mut receiver_list = receivers.lock().unwrap();
-        let mut i = 0;
+        broadcast(&head_buffer, &body_buffer, receivers.clone());
+    }
 
-        while i < receiver_list.len(){
-            match receiver_list[i].write_all(&frame){
-                Ok(_) =>{
-                    let _ = receiver_list[i].flush();
-                    i+=1;
-                }
-                Err(_)=>{
-                    //remove reciever
-                    eprintln!("Dropping reciever");
-                    let _ = receiver_list.swap_remove(i).shutdown(Shutdown::Both);
-                }
+    let _ = src.shutdown(Shutdown::Both);
+}
+
+
+fn broadcast(header: &[u8], body: &[u8], receivers: SharedList){
+    let mut receiver_list = receivers.lock().unwrap();
+    let mut i=0;
+
+    //prepare io slices
+    let buffers = &[IoSlice::new(header),IoSlice::new(body)];
+
+    while i < receiver_list.len(){
+        match receiver_list[i].write_vectored(buffers){
+            Ok(x) if x == header.len() + body.len()=>{
+                i+=1;
             }
+            _=>{
+                eprintln!("Dropping reciever");
+                let _ =receiver_list.swap_remove(i).shutdown(Shutdown::Both);
+            }   
         }
     }
-    let _ = src.shutdown(Shutdown::Both);
 }
 
 
